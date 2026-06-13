@@ -8,9 +8,9 @@ use alvr_client_core::{
 };
 use alvr_common::{
     DETACHED_CONTROLLER_LEFT_ID, DETACHED_CONTROLLER_RIGHT_ID, HAND_LEFT_ID, HAND_RIGHT_ID,
-    HEAD_ID, LEFT_X_CLICK_ID, Pose, RelaxedAtomic, ViewParams,
+    HEAD_ID, LEFT_THUMBSTICK_CLICK_ID, Pose, RelaxedAtomic, ViewParams,
     anyhow::Result,
-    error,
+    error, info, warn,
     glam::{UVec2, Vec2},
     parking_lot::RwLock,
 };
@@ -267,8 +267,17 @@ impl StreamContext {
             xr::ReferenceSpaceType::VIEW,
         ));
 
-        // Quest reports ~1×1 m with no roomscale boundary; override to 20×20 m so
-        // the SteamVR chaperone floor grid renders correctly in the streamed view.
+        match self
+            .xr_session
+            .reference_space_bounds_rect(xr::ReferenceSpaceType::STAGE)
+        {
+            Ok(Some(r)) => info!(
+                "[playspace] Quest reports bounds {:.2} x {:.2} m (overriding to 20x20)",
+                r.width, r.height
+            ),
+            Ok(None) => warn!("[playspace] Quest returned no bounds (no guardian set); overriding to 20x20"),
+            Err(e) => warn!("[playspace] reference_space_bounds_rect failed: {e}; overriding to 20x20"),
+        }
         self.core_context.send_playspace(Some(Vec2::new(20.0, 20.0)));
 
         if let Some(running) = self.input_thread.take() {
@@ -573,15 +582,23 @@ fn stream_input_loop(
     let mut last_palm_poses = [Pose::IDENTITY; 2];
     let mut last_view_params = [ViewParams::DUMMY; 2];
 
-    // Boundary proximity alert state (volatile: always enabled at stream start, X held 3 s toggles)
+    // Guardian mode: audio alert + 20×20 play area (floor grid) toggled as a unit.
+    // Left thumbstick held 3 s toggles on/off.
     #[cfg(target_os = "android")]
-    let alert_stream = rodio::OutputStreamBuilder::open_default_stream().ok();
+    let alert_stream = {
+        match rodio::OutputStreamBuilder::open_default_stream() {
+            Ok(s) => { info!("[guardian] audio output stream opened"); Some(s) }
+            Err(e) => { warn!("[guardian] failed to open audio output stream: {e}"); None }
+        }
+    };
     #[cfg(target_os = "android")]
-    let mut alert_active = true;
+    let mut guardian_active = true;
     #[cfg(target_os = "android")]
-    let mut x_held_since: Option<Instant> = None;
+    info!("[guardian] initialized, enabled=true (left-stick 3 s to toggle)");
     #[cfg(target_os = "android")]
-    let mut x_toggle_consumed = false;
+    let mut stick_held_since: Option<Instant> = None;
+    #[cfg(target_os = "android")]
+    let mut stick_toggle_consumed = false;
     #[cfg(target_os = "android")]
     let mut next_beep_time = Instant::now();
     #[cfg(target_os = "android")]
@@ -626,28 +643,37 @@ fn stream_input_loop(
             last_view_params = views;
         }
 
-        // X held 3 s → toggle boundary alert
+        // Left thumbstick held 3 s → toggle guardian mode (audio alert + floor grid)
         #[cfg(target_os = "android")]
-        if let Some(ButtonAction::Binary(x_action)) =
-            int_ctx.button_actions.get(&*LEFT_X_CLICK_ID)
+        if let Some(ButtonAction::Binary(stick_action)) =
+            int_ctx.button_actions.get(&*LEFT_THUMBSTICK_CLICK_ID)
         {
-            if let Ok(state) = x_action.state(&xr_session, xr::Path::NULL) {
+            if let Ok(state) = stick_action.state(&xr_session, xr::Path::NULL) {
                 if state.current_state {
-                    let held = x_held_since.get_or_insert(Instant::now());
-                    if !x_toggle_consumed && held.elapsed() >= Duration::from_secs(3) {
-                        alert_active = !alert_active;
-                        x_toggle_consumed = true;
+                    let held = stick_held_since.get_or_insert(Instant::now());
+                    if !stick_toggle_consumed && held.elapsed() >= Duration::from_secs(3) {
+                        guardian_active = !guardian_active;
+                        stick_toggle_consumed = true;
+                        info!("[guardian] toggled → enabled={}", guardian_active);
+                        // Immediately push the new play area to the server so the
+                        // chaperone floor grid appears/disappears without reconnecting.
+                        let area = if guardian_active {
+                            Vec2::new(20.0, 20.0)
+                        } else {
+                            Vec2::new(0.001, 0.001) // sentinel: server sets FadeDistance=0
+                        };
+                        core_ctx.send_playspace(Some(area));
                     }
                 } else {
-                    x_held_since = None;
-                    x_toggle_consumed = false;
+                    stick_held_since = None;
+                    stick_toggle_consumed = false;
                 }
             }
         }
 
         // Boundary proximity alert
         #[cfg(target_os = "android")]
-        if alert_active {
+        if guardian_active {
             let now = Instant::now();
             if now >= bounds_next_refresh {
                 bounds_half_extents = xr_session

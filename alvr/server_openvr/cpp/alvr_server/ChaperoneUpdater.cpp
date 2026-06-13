@@ -56,7 +56,7 @@ void ShutdownOpenvrClient() {
 bool IsOpenvrClientReady() { return isOpenvrInit; }
 
 void _SetChaperoneArea(float areaWidth, float areaHeight) {
-    Debug("SetChaperoneArea");
+    Info("SetChaperoneArea: %.2f x %.2f m", areaWidth, areaHeight);
 
 #ifndef __APPLE__
     std::unique_lock<std::mutex> lock(chaperone_mutex);
@@ -85,17 +85,26 @@ void _SetChaperoneArea(float areaWidth, float areaHeight) {
         vr::VRChaperoneSetup()->SetWorkingSeatedZeroPoseToRawTrackingPose(&MATRIX_IDENTITY);
         vr::VRChaperoneSetup()->SetWorkingPlayAreaSize(areaWidth, areaHeight);
         vr::VRChaperoneSetup()->CommitWorkingCopy(vr::EChaperoneConfigFile_Live);
+        Info("SetChaperoneArea: committed perimeter %.2fx%.2f to Live config", areaWidth, areaHeight);
+    } else {
+        Warn("SetChaperoneArea: VRChaperoneSetup() is null, perimeter not committed");
     }
 
     auto settings = vr::VRSettings();
 
     if (settings != nullptr) {
-        // Large fade distance keeps the floor grid always visible regardless of position
+        // area < 0.01 is the client's sentinel for "guardian off" → hide chaperone.
+        // Otherwise use 99 m so the floor grid is always visible throughout the play area.
+        const float fadeDistance = (areaWidth > 0.01f && areaHeight > 0.01f) ? 99.0f : 0.0f;
+        Info("SetChaperoneArea: setting FadeDistance=%.1f (guardian %s)",
+             fadeDistance, fadeDistance > 0.0f ? "on" : "off");
         vr::VRSettings()->SetFloat(
             vr::k_pch_CollisionBounds_Section,
             vr::k_pch_CollisionBounds_FadeDistance_Float,
-            99.0f
+            fadeDistance
         );
+    } else {
+        Warn("SetChaperoneArea: VRSettings() is null, FadeDistance not set");
     }
 
 #endif
