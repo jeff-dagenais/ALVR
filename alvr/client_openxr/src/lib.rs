@@ -528,7 +528,13 @@ pub fn entry_point() {
                         if config.passthrough.is_some() && passthrough_layer.is_none() {
                             passthrough_layer = PassthroughLayer::new(&xr_session, platform).ok();
                         } else if config.passthrough.is_none() && passthrough_layer.is_some() {
-                            passthrough_layer = None;
+                            // Only destroy if guardian config mode is not active
+                            let guardian_wants = stream_context
+                                .as_ref()
+                                .map_or(false, |s| s.guardian_passthrough.value());
+                            if !guardian_wants {
+                                passthrough_layer = None;
+                            }
                         }
 
                         if let Some(cpu_performance_level) = &config.cpu_performance_level {
@@ -580,6 +586,18 @@ pub fn entry_point() {
                     .unwrap();
 
                 continue;
+            }
+
+            // Guardian config mode requests passthrough for the duration of the UI.
+            // Sync passthrough_layer with the flag from the input thread.
+            // Must happen before render() to avoid overlapping borrows.
+            if let Some(stream) = &stream_context {
+                let want = stream.guardian_passthrough.value() || stream.uses_passthrough();
+                if want && passthrough_layer.is_none() {
+                    passthrough_layer = PassthroughLayer::new(&xr_session, platform).ok();
+                } else if !want && passthrough_layer.is_some() {
+                    passthrough_layer = None;
+                }
             }
 
             // todo: allow rendering lobby and stream layers at the same time and add cross fade

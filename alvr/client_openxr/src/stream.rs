@@ -96,6 +96,7 @@ pub struct StreamContext {
     last_good_view_params: [ViewParams; 2],
     input_thread: Option<JoinHandle<()>>,
     input_thread_running: Arc<RelaxedAtomic>,
+    pub guardian_passthrough: Arc<RelaxedAtomic>,
     config: ParsedStreamConfig,
     target_view_resolution: UVec2,
     renderer: StreamRenderer,
@@ -219,6 +220,7 @@ impl StreamContext {
         }
 
         let input_thread_running = Arc::new(RelaxedAtomic::new(false));
+        let guardian_passthrough = Arc::new(RelaxedAtomic::new(false));
 
         let stage_reference_space = Arc::new(interaction::get_reference_space(
             &xr_session,
@@ -240,6 +242,7 @@ impl StreamContext {
             last_good_view_params: [ViewParams::DUMMY; 2],
             input_thread: None,
             input_thread_running,
+            guardian_passthrough,
             config,
             target_view_resolution,
             renderer,
@@ -294,6 +297,7 @@ impl StreamContext {
             let view_reference_space = Arc::clone(&self.view_reference_space);
             let refresh_rate = self.config.refresh_rate_hint;
             let running = Arc::clone(&self.input_thread_running);
+            let guardian_passthrough = Arc::clone(&self.guardian_passthrough);
             move || {
                 stream_input_loop(
                     &core_ctx,
@@ -303,6 +307,7 @@ impl StreamContext {
                     &view_reference_space,
                     refresh_rate,
                     running,
+                    guardian_passthrough,
                 )
             }
         }));
@@ -569,6 +574,33 @@ impl<I: rodio::Source<Item = f32>> rodio::Source for BeepEnvelope<I> {
     fn total_duration(&self) -> Option<Duration> { self.inner.total_duration() }
 }
 
+// Guardian area options cycled by short-pressing the left thumbstick while in config mode.
+// None = disabled (no floor grid, no audio alert).
+// Some(half) = half-extent in metres; full area = half*2 on each axis.
+#[cfg(target_os = "android")]
+const GUARDIAN_CYCLE: &[Option<f32>] = &[
+    None,        // disabled
+    Some(10.0),  // 20×20 m
+    Some(7.5),   // 15×15 m
+    Some(5.0),   // 10×10 m
+    Some(2.5),   // 5×5 m
+];
+
+#[cfg(target_os = "android")]
+fn apply_guardian_mode(mode: Option<f32>, core_ctx: &ClientCoreContext, idx: usize) {
+    match mode {
+        None => {
+            info!("[guardian] config[{}] = disabled", idx);
+            core_ctx.send_playspace(Some(Vec2::new(0.001, 0.001)));
+        }
+        Some(half) => {
+            let full = half * 2.0;
+            info!("[guardian] config[{}] = {:.0}x{:.0} m", idx, full, full);
+            core_ctx.send_playspace(Some(Vec2::new(full, full)));
+        }
+    }
+}
+
 fn stream_input_loop(
     core_ctx: &ClientCoreContext,
     xr_session: xr::Session<xr::OpenGlEs>,
@@ -577,13 +609,17 @@ fn stream_input_loop(
     view_reference_space: &xr::Space,
     refresh_rate: f32,
     running: Arc<RelaxedAtomic>,
+    #[cfg(target_os = "android")] guardian_passthrough: Arc<RelaxedAtomic>,
+    #[cfg(not(target_os = "android"))] _guardian_passthrough: Arc<RelaxedAtomic>,
 ) {
     let mut last_controller_poses = [Pose::IDENTITY; 2];
     let mut last_palm_poses = [Pose::IDENTITY; 2];
     let mut last_view_params = [ViewParams::DUMMY; 2];
 
-    // Guardian mode: audio alert + 20×20 play area (floor grid) toggled as a unit.
-    // Left thumbstick held 3 s toggles on/off.
+    // ── Guardian state ─────────────────────────────────────────────────────────
+    // current_mode_idx indexes GUARDIAN_CYCLE; starts at 1 (20×20 m, enabled).
+    // ui_in_config_mode: left-stick held 3 s enters config mode (passthrough on,
+    //   4 s timeout).  Short tap in config mode cycles the mode.
     #[cfg(target_os = "android")]
     let alert_stream = {
         match rodio::OutputStreamBuilder::open_default_stream() {
@@ -592,19 +628,26 @@ fn stream_input_loop(
         }
     };
     #[cfg(target_os = "android")]
-    let mut guardian_active = true;
+    let mut current_mode_idx: usize = 1; // 20×20 m default
     #[cfg(target_os = "android")]
-    info!("[guardian] initialized, enabled=true (left-stick 3 s to toggle)");
+    info!("[guardian] initialized: config[1]=20x20 m, left-stick 3 s → config mode");
+    // UI state: false = Normal, true = ConfigMode
     #[cfg(target_os = "android")]
-    let mut stick_held_since: Option<Instant> = None;
+    let mut ui_in_config_mode = false;
     #[cfg(target_os = "android")]
-    let mut stick_toggle_consumed = false;
+    let mut config_mode_timeout = Instant::now();
+    // Long-press tracking (Normal → ConfigMode)
+    #[cfg(target_os = "android")]
+    let mut stick_pressed_since: Option<Instant> = None;
+    #[cfg(target_os = "android")]
+    let mut long_press_consumed = false;
+    // Tap tracking while in config mode (debounce: only count press that started after entry)
+    #[cfg(target_os = "android")]
+    let mut config_entry_released = false; // true once stick released after entering config mode
+    #[cfg(target_os = "android")]
+    let mut config_tap_armed = false; // true on press-down while in config mode (after entry released)
     #[cfg(target_os = "android")]
     let mut next_beep_time = Instant::now();
-    #[cfg(target_os = "android")]
-    let mut bounds_half_extents: Option<[f32; 2]> = None;
-    #[cfg(target_os = "android")]
-    let mut bounds_next_refresh = Instant::now();
 
     let mut deadline = Instant::now();
     let frame_interval = Duration::from_secs_f32(1.0 / refresh_rate);
@@ -643,69 +686,89 @@ fn stream_input_loop(
             last_view_params = views;
         }
 
-        // Left thumbstick held 3 s → toggle guardian mode (audio alert + floor grid)
+        // ── Guardian state machine ──────────────────────────────────────────────
         #[cfg(target_os = "android")]
         if let Some(ButtonAction::Binary(stick_action)) =
             int_ctx.button_actions.get(&*LEFT_THUMBSTICK_CLICK_ID)
         {
             if let Ok(state) = stick_action.state(&xr_session, xr::Path::NULL) {
-                if state.current_state {
-                    let held = stick_held_since.get_or_insert(Instant::now());
-                    if !stick_toggle_consumed && held.elapsed() >= Duration::from_secs(3) {
-                        guardian_active = !guardian_active;
-                        stick_toggle_consumed = true;
-                        info!("[guardian] toggled → enabled={}", guardian_active);
-                        // Immediately push the new play area to the server so the
-                        // chaperone floor grid appears/disappears without reconnecting.
-                        let area = if guardian_active {
-                            Vec2::new(20.0, 20.0)
-                        } else {
-                            Vec2::new(0.001, 0.001) // sentinel: server sets FadeDistance=0
-                        };
-                        core_ctx.send_playspace(Some(area));
+                let pressed = state.current_state;
+                let t = Instant::now();
+
+                if !ui_in_config_mode {
+                    // Normal: watch for long press (3 s) to enter config mode
+                    if pressed {
+                        let held = stick_pressed_since.get_or_insert(t);
+                        if !long_press_consumed && held.elapsed() >= Duration::from_secs(3) {
+                            ui_in_config_mode = true;
+                            long_press_consumed = true;
+                            config_entry_released = false;
+                            config_tap_armed = false;
+                            config_mode_timeout = t + Duration::from_secs(4);
+                            guardian_passthrough.set(true);
+                            info!("[guardian] entered config mode (passthrough on, 4 s timeout)");
+                        }
+                    } else {
+                        stick_pressed_since = None;
+                        long_press_consumed = false;
                     }
                 } else {
-                    stick_held_since = None;
-                    stick_toggle_consumed = false;
+                    // Config mode: short tap cycles guardian option; 4 s inactivity exits
+                    if !pressed {
+                        if !config_entry_released {
+                            // first release after long-press entry — ignore
+                            config_entry_released = true;
+                            stick_pressed_since = None;
+                            long_press_consumed = false;
+                        } else if config_tap_armed {
+                            // released a tap → cycle mode
+                            current_mode_idx = (current_mode_idx + 1) % GUARDIAN_CYCLE.len();
+                            apply_guardian_mode(GUARDIAN_CYCLE[current_mode_idx], core_ctx, current_mode_idx);
+                            config_mode_timeout = t + Duration::from_secs(4);
+                        }
+                        config_tap_armed = false;
+                    } else {
+                        // pressed in config mode
+                        if config_entry_released {
+                            config_tap_armed = true;
+                            config_mode_timeout = t + Duration::from_secs(4); // reset on press too
+                        }
+                    }
+
+                    // Check timeout
+                    if t >= config_mode_timeout {
+                        ui_in_config_mode = false;
+                        config_tap_armed = false;
+                        guardian_passthrough.set(false);
+                        info!("[guardian] exited config mode (timeout)");
+                    }
                 }
             }
         }
 
-        // Boundary proximity alert
+        // ── Boundary proximity audio alert ──────────────────────────────────────
         #[cfg(target_os = "android")]
-        if guardian_active {
-            let now = Instant::now();
-            if now >= bounds_next_refresh {
-                bounds_half_extents = xr_session
-                    .reference_space_bounds_rect(xr::ReferenceSpaceType::STAGE)
-                    .ok()
-                    .flatten()
-                    .map(|b| [b.width * 0.5, b.height * 0.5]);
-                bounds_next_refresh = now + Duration::from_secs(5);
-            }
-            if let Some([hw, hh]) = bounds_half_extents {
-                let hx = head_motion.pose.position.x;
-                let hz = head_motion.pose.position.z;
-                let dx = (hx.abs() - hw).max(0.0);
-                let dz = (hz.abs() - hh).max(0.0);
-                let dist_outside = (dx * dx + dz * dz).sqrt();
-                // 0.0 at boundary, 1.0 at 1.5 m outside
-                let alert_level = (dist_outside / 1.5).min(1.0);
-                if alert_level > 0.0 && now >= next_beep_time {
-                    if let Some(ref stream) = alert_stream {
-                        use rodio::Source as _;
-                        let raw = rodio::source::SineWave::new(880.0)
-                            .take_duration(Duration::from_millis(100));
-                        let beep = BeepEnvelope::new(raw, 10, 100).amplify(alert_level);
-                        stream.mixer().add(beep);
-                    }
-                    // Interval: 3.0 s when barely outside → 0.3 s at 1.5 m+ outside
-                    let interval_secs = 3.0 - 2.7 * alert_level;
-                    let interval = Duration::from_secs_f32(interval_secs);
-                    // Schedule from previous deadline to avoid jitter drift; floor at now+interval
-                    // to prevent catch-up bursts after long gaps.
-                    next_beep_time = (next_beep_time + interval).max(now + interval);
+        if let Some(half) = GUARDIAN_CYCLE[current_mode_idx] {
+            let t = Instant::now();
+            let hx = head_motion.pose.position.x;
+            let hz = head_motion.pose.position.z;
+            let dx = (hx.abs() - half).max(0.0);
+            let dz = (hz.abs() - half).max(0.0);
+            let dist_outside = (dx * dx + dz * dz).sqrt();
+            // 0.0 at boundary, 1.0 at 1.5 m outside
+            let alert_level = (dist_outside / 1.5).min(1.0);
+            if alert_level > 0.0 && t >= next_beep_time {
+                if let Some(ref stream) = alert_stream {
+                    use rodio::Source as _;
+                    let raw = rodio::source::SineWave::new(880.0)
+                        .take_duration(Duration::from_millis(100));
+                    let beep = BeepEnvelope::new(raw, 10, 100).amplify(alert_level);
+                    stream.mixer().add(beep);
                 }
+                // Interval: 3.0 s when barely outside → 0.3 s at 1.5 m+ outside
+                let interval_secs = 3.0 - 2.7 * alert_level;
+                let interval = Duration::from_secs_f32(interval_secs);
+                next_beep_time = (next_beep_time + interval).max(t + interval);
             }
         }
 
