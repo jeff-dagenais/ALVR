@@ -267,12 +267,9 @@ impl StreamContext {
             xr::ReferenceSpaceType::VIEW,
         ));
 
-        self.core_context.send_playspace(
-            self.xr_session
-                .reference_space_bounds_rect(xr::ReferenceSpaceType::STAGE)
-                .unwrap()
-                .map(|a| Vec2::new(a.width, a.height)),
-        );
+        // Quest reports ~1×1 m with no roomscale boundary; override to 20×20 m so
+        // the SteamVR chaperone floor grid renders correctly in the streamed view.
+        self.core_context.send_playspace(Some(Vec2::new(20.0, 20.0)));
 
         if let Some(running) = self.input_thread.take() {
             running.join().ok();

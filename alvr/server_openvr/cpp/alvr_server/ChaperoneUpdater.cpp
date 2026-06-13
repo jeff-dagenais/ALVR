@@ -90,9 +90,11 @@ void _SetChaperoneArea(float areaWidth, float areaHeight) {
     auto settings = vr::VRSettings();
 
     if (settings != nullptr) {
-        // Hide SteamVR Chaperone
+        // Large fade distance keeps the floor grid always visible regardless of position
         vr::VRSettings()->SetFloat(
-            vr::k_pch_CollisionBounds_Section, vr::k_pch_CollisionBounds_FadeDistance_Float, 0.0f
+            vr::k_pch_CollisionBounds_Section,
+            vr::k_pch_CollisionBounds_FadeDistance_Float,
+            99.0f
         );
     }
 
