@@ -860,6 +860,12 @@ pub struct AudioConfig {
     )]
     #[cfg_attr(not(windows), schema(strings(display_name = "Headset microphone")))]
     pub microphone: Switch<MicrophoneConfig>,
+
+    #[schema(strings(
+        display_name = "Boundary proximity alert",
+        help = "Play an audible beep when outside the play area. Beep rate and volume increase with distance, reaching maximum at 1.5m outside."
+    ))]
+    pub boundary_alert_enabled: bool,
 }
 
 #[derive(SettingsSchema, Serialize, Deserialize, Clone)]
@@ -1964,6 +1970,7 @@ pub fn session_settings_default() -> SettingsDefault {
                     },
                 },
             },
+            boundary_alert_enabled: true,
         },
         headset: HeadsetConfigDefault {
             emulation_mode: HeadsetEmulationModeDefault {

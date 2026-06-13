@@ -1,6 +1,6 @@
 use crate::{
     graphics::{self, ProjectionLayerAlphaConfig, ProjectionLayerBuilder},
-    interaction::{self, InteractionContext, InteractionSourcesConfig},
+    interaction::{self, ButtonAction, InteractionContext, InteractionSourcesConfig},
 };
 use alvr_client_core::{
     ClientCoreContext,
@@ -8,7 +8,7 @@ use alvr_client_core::{
 };
 use alvr_common::{
     DETACHED_CONTROLLER_LEFT_ID, DETACHED_CONTROLLER_RIGHT_ID, HAND_LEFT_ID, HAND_RIGHT_ID,
-    HEAD_ID, Pose, RelaxedAtomic, ViewParams,
+    HEAD_ID, LEFT_X_CLICK_ID, Pose, RelaxedAtomic, ViewParams,
     anyhow::Result,
     error,
     glam::{UVec2, Vec2},
@@ -47,6 +47,7 @@ pub struct ParsedStreamConfig {
     pub buffering_history_weight: f32,
     pub decoder_options: Vec<(String, MediacodecProperty)>,
     pub interaction_sources: InteractionSourcesConfig,
+    pub boundary_alert_enabled: bool,
 }
 
 impl ParsedStreamConfig {
@@ -80,6 +81,7 @@ impl ParsedStreamConfig {
             buffering_history_weight: config.settings.video.buffering_history_weight,
             decoder_options: config.settings.video.mediacodec_extra_options.clone(),
             interaction_sources: InteractionSourcesConfig::new(config),
+            boundary_alert_enabled: config.settings.audio.boundary_alert_enabled,
         }
     }
 }
@@ -513,6 +515,54 @@ impl Drop for StreamContext {
     }
 }
 
+#[cfg(target_os = "android")]
+struct BeepEnvelope<I> {
+    inner: I,
+    attack: u64,
+    release: u64,
+    total: u64,
+    pos: u64,
+}
+
+#[cfg(target_os = "android")]
+impl<I: rodio::Source<Item = f32>> BeepEnvelope<I> {
+    fn new(inner: I, attack_ms: u64, total_ms: u64) -> Self {
+        let sr = inner.sample_rate() as u64;
+        let ch = inner.channels() as u64;
+        let attack = sr * attack_ms * ch / 1000;
+        let total = sr * total_ms * ch / 1000;
+        Self { inner, attack, release: attack, total, pos: 0 }
+    }
+}
+
+#[cfg(target_os = "android")]
+impl<I: rodio::Source<Item = f32>> Iterator for BeepEnvelope<I> {
+    type Item = f32;
+    fn next(&mut self) -> Option<f32> {
+        let attack_gain = if self.attack > 0 {
+            (self.pos as f32 / self.attack as f32).min(1.0)
+        } else {
+            1.0
+        };
+        let release_gain = if self.release > 0 {
+            (self.total.saturating_sub(self.pos) as f32 / self.release as f32).min(1.0)
+        } else {
+            1.0
+        };
+        let gain = attack_gain.min(release_gain);
+        self.pos += 1;
+        self.inner.next().map(|s| s * gain)
+    }
+}
+
+#[cfg(target_os = "android")]
+impl<I: rodio::Source<Item = f32>> rodio::Source for BeepEnvelope<I> {
+    fn current_span_len(&self) -> Option<usize> { self.inner.current_span_len() }
+    fn channels(&self) -> u16 { self.inner.channels() }
+    fn sample_rate(&self) -> u32 { self.inner.sample_rate() }
+    fn total_duration(&self) -> Option<Duration> { self.inner.total_duration() }
+}
+
 fn stream_input_loop(
     core_ctx: &ClientCoreContext,
     xr_session: xr::Session<xr::OpenGlEs>,
@@ -525,6 +575,22 @@ fn stream_input_loop(
     let mut last_controller_poses = [Pose::IDENTITY; 2];
     let mut last_palm_poses = [Pose::IDENTITY; 2];
     let mut last_view_params = [ViewParams::DUMMY; 2];
+
+    // Boundary proximity alert state (volatile: always enabled at stream start, X held 3 s toggles)
+    #[cfg(target_os = "android")]
+    let alert_stream = rodio::OutputStreamBuilder::open_default_stream().ok();
+    #[cfg(target_os = "android")]
+    let mut alert_active = true;
+    #[cfg(target_os = "android")]
+    let mut x_held_since: Option<Instant> = None;
+    #[cfg(target_os = "android")]
+    let mut x_toggle_consumed = false;
+    #[cfg(target_os = "android")]
+    let mut next_beep_time = Instant::now();
+    #[cfg(target_os = "android")]
+    let mut bounds_half_extents: Option<[f32; 2]> = None;
+    #[cfg(target_os = "android")]
+    let mut bounds_next_refresh = Instant::now();
 
     let mut deadline = Instant::now();
     let frame_interval = Duration::from_secs_f32(1.0 / refresh_rate);
@@ -561,6 +627,63 @@ fn stream_input_loop(
         if let Some(views) = local_views {
             core_ctx.send_view_params(views);
             last_view_params = views;
+        }
+
+        // X held 3 s → toggle boundary alert
+        #[cfg(target_os = "android")]
+        if let Some(ButtonAction::Binary(x_action)) =
+            int_ctx.button_actions.get(&*LEFT_X_CLICK_ID)
+        {
+            if let Ok(state) = x_action.state(&xr_session, xr::Path::NULL) {
+                if state.current_state {
+                    let held = x_held_since.get_or_insert(Instant::now());
+                    if !x_toggle_consumed && held.elapsed() >= Duration::from_secs(3) {
+                        alert_active = !alert_active;
+                        x_toggle_consumed = true;
+                    }
+                } else {
+                    x_held_since = None;
+                    x_toggle_consumed = false;
+                }
+            }
+        }
+
+        // Boundary proximity alert
+        #[cfg(target_os = "android")]
+        if alert_active {
+            let now = Instant::now();
+            if now >= bounds_next_refresh {
+                bounds_half_extents = xr_session
+                    .reference_space_bounds_rect(xr::ReferenceSpaceType::STAGE)
+                    .ok()
+                    .flatten()
+                    .map(|b| [b.width * 0.5, b.height * 0.5]);
+                bounds_next_refresh = now + Duration::from_secs(5);
+            }
+            if let Some([hw, hh]) = bounds_half_extents {
+                let hx = head_motion.pose.position.x;
+                let hz = head_motion.pose.position.z;
+                let dx = (hx.abs() - hw).max(0.0);
+                let dz = (hz.abs() - hh).max(0.0);
+                let dist_outside = (dx * dx + dz * dz).sqrt();
+                // 0.0 at boundary, 1.0 at 1.5 m outside
+                let alert_level = (dist_outside / 1.5).min(1.0);
+                if alert_level > 0.0 && now >= next_beep_time {
+                    if let Some(ref stream) = alert_stream {
+                        use rodio::Source as _;
+                        let raw = rodio::source::SineWave::new(880.0)
+                            .take_duration(Duration::from_millis(100));
+                        let beep = BeepEnvelope::new(raw, 10, 100).amplify(alert_level);
+                        stream.mixer().add(beep);
+                    }
+                    // Interval: 3.0 s when barely outside → 0.3 s at 1.5 m+ outside
+                    let interval_secs = 3.0 - 2.7 * alert_level;
+                    let interval = Duration::from_secs_f32(interval_secs);
+                    // Schedule from previous deadline to avoid jitter drift; floor at now+interval
+                    // to prevent catch-up bursts after long gaps.
+                    next_beep_time = (next_beep_time + interval).max(now + interval);
+                }
+            }
         }
 
         let mut device_motions = Vec::with_capacity(3);

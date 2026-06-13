@@ -26,6 +26,7 @@ openxr = "0.21"
 android-activity = { version = "=0.6.0", features = ["native-activity"] }
 libc = "0.2"
 ndk-context = "0.1"
+rodio = { version = "0.21", default-features = false }
 
 [package.metadata.android]
 package = "alvr.client.dev"                # Changed for Meta Store

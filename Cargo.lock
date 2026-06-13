@@ -267,6 +267,7 @@ dependencies = [
  "libc",
  "ndk-context",
  "openxr",
+ "rodio",
 ]
 
 [[package]]
