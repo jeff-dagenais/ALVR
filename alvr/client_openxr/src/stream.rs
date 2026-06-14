@@ -8,7 +8,7 @@ use alvr_client_core::{
 };
 use alvr_common::{
     DETACHED_CONTROLLER_LEFT_ID, DETACHED_CONTROLLER_RIGHT_ID, HAND_LEFT_ID, HAND_RIGHT_ID,
-    HEAD_ID, LEFT_THUMBSTICK_CLICK_ID, Pose, RelaxedAtomic, ViewParams,
+    HEAD_ID, LEFT_X_CLICK_ID, LEFT_Y_CLICK_ID, Pose, RelaxedAtomic, ViewParams,
     anyhow::Result,
     error, info, warn,
     glam::{UVec2, Vec2},
@@ -636,16 +636,17 @@ fn stream_input_loop(
     let mut ui_in_config_mode = false;
     #[cfg(target_os = "android")]
     let mut config_mode_timeout = Instant::now();
-    // Long-press tracking (Normal → ConfigMode)
+    // Entry: X+Y held 1.5 s simultaneously → config mode
     #[cfg(target_os = "android")]
-    let mut stick_pressed_since: Option<Instant> = None;
+    let mut both_held_since: Option<Instant> = None;
     #[cfg(target_os = "android")]
-    let mut long_press_consumed = false;
-    // Tap tracking while in config mode (debounce: only count press that started after entry)
+    let mut entry_consumed = false;
+    // After entry, track X+Y both released before arming X for cycle
     #[cfg(target_os = "android")]
-    let mut config_entry_released = false; // true once stick released after entering config mode
+    let mut entry_released = false;
+    // X tap while in config mode → cycle
     #[cfg(target_os = "android")]
-    let mut config_tap_armed = false; // true on press-down while in config mode (after entry released)
+    let mut x_armed = false;
     #[cfg(target_os = "android")]
     let mut next_beep_time = Instant::now();
 
@@ -687,61 +688,67 @@ fn stream_input_loop(
         }
 
         // ── Guardian state machine ──────────────────────────────────────────────
+        // Entry: X+Y held simultaneously 1.5 s → config mode (passthrough on).
+        // Cycle: X tap while in config mode → next area option.
+        // Exit: 4 s with no X tap → passthrough off, setting persists.
         #[cfg(target_os = "android")]
-        if let Some(ButtonAction::Binary(stick_action)) =
-            int_ctx.button_actions.get(&*LEFT_THUMBSTICK_CLICK_ID)
         {
-            if let Ok(state) = stick_action.state(&xr_session, xr::Path::NULL) {
-                let pressed = state.current_state;
-                let t = Instant::now();
+            let get_bin = |id: &u64| -> bool {
+                int_ctx
+                    .button_actions
+                    .get(id)
+                    .and_then(|a| if let ButtonAction::Binary(a) = a {
+                        a.state(&xr_session, xr::Path::NULL).ok()
+                    } else { None })
+                    .map_or(false, |s| s.current_state)
+            };
+            let x = get_bin(&LEFT_X_CLICK_ID);
+            let y = get_bin(&LEFT_Y_CLICK_ID);
+            let t = Instant::now();
 
-                if !ui_in_config_mode {
-                    // Normal: watch for long press (3 s) to enter config mode
-                    if pressed {
-                        let held = stick_pressed_since.get_or_insert(t);
-                        if !long_press_consumed && held.elapsed() >= Duration::from_secs(3) {
-                            ui_in_config_mode = true;
-                            long_press_consumed = true;
-                            config_entry_released = false;
-                            config_tap_armed = false;
-                            config_mode_timeout = t + Duration::from_secs(4);
-                            guardian_passthrough.set(true);
-                            info!("[guardian] entered config mode (passthrough on, 4 s timeout)");
-                        }
-                    } else {
-                        stick_pressed_since = None;
-                        long_press_consumed = false;
+            if !ui_in_config_mode {
+                if x && y {
+                    let held = both_held_since.get_or_insert(t);
+                    if !entry_consumed && held.elapsed() >= Duration::from_millis(1500) {
+                        ui_in_config_mode = true;
+                        entry_consumed = true;
+                        entry_released = false;
+                        x_armed = false;
+                        config_mode_timeout = t + Duration::from_secs(4);
+                        guardian_passthrough.set(true);
+                        info!("[guardian] entered config mode (X+Y held; passthrough on, 4 s timeout)");
                     }
                 } else {
-                    // Config mode: short tap cycles guardian option; 4 s inactivity exits
-                    if !pressed {
-                        if !config_entry_released {
-                            // first release after long-press entry — ignore
-                            config_entry_released = true;
-                            stick_pressed_since = None;
-                            long_press_consumed = false;
-                        } else if config_tap_armed {
-                            // released a tap → cycle mode
-                            current_mode_idx = (current_mode_idx + 1) % GUARDIAN_CYCLE.len();
-                            apply_guardian_mode(GUARDIAN_CYCLE[current_mode_idx], core_ctx, current_mode_idx);
-                            config_mode_timeout = t + Duration::from_secs(4);
-                        }
-                        config_tap_armed = false;
-                    } else {
-                        // pressed in config mode
-                        if config_entry_released {
-                            config_tap_armed = true;
-                            config_mode_timeout = t + Duration::from_secs(4); // reset on press too
-                        }
-                    }
+                    both_held_since = None;
+                    entry_consumed = false;
+                }
+            } else {
+                // Wait for X and Y to both be released after entry before arming X for cycle
+                if !entry_released && !x && !y {
+                    entry_released = true;
+                    info!("[guardian] config mode: X+Y released, X tap to cycle options");
+                }
 
-                    // Check timeout
-                    if t >= config_mode_timeout {
-                        ui_in_config_mode = false;
-                        config_tap_armed = false;
-                        guardian_passthrough.set(false);
-                        info!("[guardian] exited config mode (timeout)");
+                if entry_released {
+                    if x && !x_armed {
+                        x_armed = true;
+                        config_mode_timeout = t + Duration::from_secs(4);
+                    } else if !x && x_armed {
+                        // X released → cycle
+                        current_mode_idx = (current_mode_idx + 1) % GUARDIAN_CYCLE.len();
+                        apply_guardian_mode(GUARDIAN_CYCLE[current_mode_idx], core_ctx, current_mode_idx);
+                        x_armed = false;
+                        config_mode_timeout = t + Duration::from_secs(4);
                     }
+                }
+
+                if t >= config_mode_timeout {
+                    ui_in_config_mode = false;
+                    x_armed = false;
+                    entry_consumed = false;
+                    both_held_since = None;
+                    guardian_passthrough.set(false);
+                    info!("[guardian] exited config mode (timeout)");
                 }
             }
         }
