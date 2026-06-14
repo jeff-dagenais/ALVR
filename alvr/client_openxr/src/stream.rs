@@ -23,9 +23,13 @@ use alvr_session::{
 use alvr_system_info::Platform;
 use openxr as xr;
 use std::{
+    collections::HashMap,
     ptr,
     rc::Rc,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -97,6 +101,7 @@ pub struct StreamContext {
     input_thread: Option<JoinHandle<()>>,
     input_thread_running: Arc<RelaxedAtomic>,
     pub guardian_passthrough: Arc<RelaxedAtomic>,
+    pub guardian_mode_idx: Arc<AtomicUsize>,
     config: ParsedStreamConfig,
     target_view_resolution: UVec2,
     renderer: StreamRenderer,
@@ -221,6 +226,10 @@ impl StreamContext {
 
         let input_thread_running = Arc::new(RelaxedAtomic::new(false));
         let guardian_passthrough = Arc::new(RelaxedAtomic::new(false));
+        #[cfg(target_os = "android")]
+        let guardian_mode_idx = Arc::new(AtomicUsize::new(DEFAULT_GUARDIAN_IDX));
+        #[cfg(not(target_os = "android"))]
+        let guardian_mode_idx = Arc::new(AtomicUsize::new(1));
 
         let stage_reference_space = Arc::new(interaction::get_reference_space(
             &xr_session,
@@ -243,6 +252,7 @@ impl StreamContext {
             input_thread: None,
             input_thread_running,
             guardian_passthrough,
+            guardian_mode_idx,
             config,
             target_view_resolution,
             renderer,
@@ -258,6 +268,22 @@ impl StreamContext {
         self.config.passthrough.is_some()
     }
 
+    pub fn set_guardian_passthrough(&mut self, active: bool) {
+        if active {
+            if self.config.passthrough.is_none() {
+                self.config.passthrough =
+                    Some(PassthroughMode::Blend { premultiplied_alpha: false, threshold: 1.0 });
+            }
+        } else {
+            if matches!(
+                self.config.passthrough,
+                Some(PassthroughMode::Blend { threshold, .. }) if (threshold - 1.0).abs() < f32::EPSILON
+            ) {
+                self.config.passthrough = None;
+            }
+        }
+    }
+
     pub fn update_reference_space(&mut self) {
         self.input_thread_running.set(false);
 
@@ -270,17 +296,30 @@ impl StreamContext {
             xr::ReferenceSpaceType::VIEW,
         ));
 
-        match self
-            .xr_session
-            .reference_space_bounds_rect(xr::ReferenceSpaceType::STAGE)
+        #[cfg(target_os = "android")]
         {
-            Ok(Some(r)) => info!(
-                "[playspace] Quest reports bounds {:.2} x {:.2} m (overriding to 20x20)",
-                r.width, r.height
-            ),
-            Ok(None) => warn!("[playspace] Quest returned no bounds (no guardian set); overriding to 20x20"),
-            Err(e) => warn!("[playspace] reference_space_bounds_rect failed: {e}; overriding to 20x20"),
+            let idx = self.guardian_mode_idx.load(Ordering::Relaxed);
+            let area = match GUARDIAN_CYCLE[idx] {
+                None => Vec2::new(0.001, 0.001),
+                Some(half) => Vec2::new(half * 2.0, half * 2.0),
+            };
+            match self
+                .xr_session
+                .reference_space_bounds_rect(xr::ReferenceSpaceType::STAGE)
+            {
+                Ok(Some(r)) => info!(
+                    "[playspace] Quest reports {:.2}x{:.2} m; sending guardian config[{}]={:.0}x{:.0} m",
+                    r.width, r.height, idx, area.x, area.y
+                ),
+                Ok(None) => info!(
+                    "[playspace] Quest reports no bounds; sending guardian config[{}]={:.0}x{:.0} m",
+                    idx, area.x, area.y
+                ),
+                Err(e) => warn!("[playspace] reference_space_bounds_rect failed: {e}"),
+            }
+            self.core_context.send_playspace(Some(area));
         }
+        #[cfg(not(target_os = "android"))]
         self.core_context.send_playspace(Some(Vec2::new(20.0, 20.0)));
 
         if let Some(running) = self.input_thread.take() {
@@ -298,6 +337,7 @@ impl StreamContext {
             let refresh_rate = self.config.refresh_rate_hint;
             let running = Arc::clone(&self.input_thread_running);
             let guardian_passthrough = Arc::clone(&self.guardian_passthrough);
+            let guardian_mode_idx = Arc::clone(&self.guardian_mode_idx);
             move || {
                 stream_input_loop(
                     &core_ctx,
@@ -308,6 +348,7 @@ impl StreamContext {
                     refresh_rate,
                     running,
                     guardian_passthrough,
+                    guardian_mode_idx,
                 )
             }
         }));
@@ -581,10 +622,13 @@ impl<I: rodio::Source<Item = f32>> rodio::Source for BeepEnvelope<I> {
 const GUARDIAN_CYCLE: &[Option<f32>] = &[
     None,        // disabled
     Some(10.0),  // 20×20 m
-    Some(7.5),   // 15×15 m
+    Some(7.5),   // 15×15 m  ← default (index 2)
     Some(5.0),   // 10×10 m
-    Some(2.5),   // 5×5 m
+    Some(2.5),   //  5×5 m
+    Some(1.25),  //  2.5×2.5 m
 ];
+#[cfg(target_os = "android")]
+const DEFAULT_GUARDIAN_IDX: usize = 2; // 15×15 m
 
 #[cfg(target_os = "android")]
 fn apply_guardian_mode(mode: Option<f32>, core_ctx: &ClientCoreContext, idx: usize) {
@@ -611,6 +655,8 @@ fn stream_input_loop(
     running: Arc<RelaxedAtomic>,
     #[cfg(target_os = "android")] guardian_passthrough: Arc<RelaxedAtomic>,
     #[cfg(not(target_os = "android"))] _guardian_passthrough: Arc<RelaxedAtomic>,
+    #[cfg(target_os = "android")] guardian_mode_idx: Arc<AtomicUsize>,
+    #[cfg(not(target_os = "android"))] _guardian_mode_idx: Arc<AtomicUsize>,
 ) {
     let mut last_controller_poses = [Pose::IDENTITY; 2];
     let mut last_palm_poses = [Pose::IDENTITY; 2];
@@ -628,9 +674,13 @@ fn stream_input_loop(
         }
     };
     #[cfg(target_os = "android")]
-    let mut current_mode_idx: usize = 1; // 20×20 m default
+    let mut current_mode_idx: usize = guardian_mode_idx.load(Ordering::Relaxed);
     #[cfg(target_os = "android")]
-    info!("[guardian] initialized: config[1]=20x20 m, left-stick 3 s → config mode");
+    {
+        let half = GUARDIAN_CYCLE[current_mode_idx];
+        let label = half.map_or("disabled".to_string(), |h| format!("{:.0}x{:.0} m", h*2.0, h*2.0));
+        info!("[guardian] initialized: config[{}]={} (X+Y hold 1.5 s → config mode, X tap → cycle)", current_mode_idx, label);
+    }
     // UI state: false = Normal, true = ConfigMode
     #[cfg(target_os = "android")]
     let mut ui_in_config_mode = false;
@@ -649,6 +699,9 @@ fn stream_input_loop(
     let mut x_armed = false;
     #[cfg(target_os = "android")]
     let mut next_beep_time = Instant::now();
+    // Button edge-detection for debug logging (identify unknown button IDs)
+    #[cfg(target_os = "android")]
+    let mut prev_button_states: HashMap<u64, bool> = HashMap::new();
 
     let mut deadline = Instant::now();
     let frame_interval = Duration::from_secs_f32(1.0 / refresh_rate);
@@ -736,6 +789,7 @@ fn stream_input_loop(
                     } else if !x && x_armed {
                         // X released → cycle
                         current_mode_idx = (current_mode_idx + 1) % GUARDIAN_CYCLE.len();
+                        guardian_mode_idx.store(current_mode_idx, Ordering::Relaxed);
                         apply_guardian_mode(GUARDIAN_CYCLE[current_mode_idx], core_ctx, current_mode_idx);
                         x_armed = false;
                         config_mode_timeout = t + Duration::from_secs(4);
@@ -749,6 +803,24 @@ fn stream_input_loop(
                     both_held_since = None;
                     guardian_passthrough.set(false);
                     info!("[guardian] exited config mode (timeout)");
+                }
+            }
+        }
+
+        // ── Button debug logging (log every binary button on press edge) ────────
+        #[cfg(target_os = "android")]
+        for (id, action) in &int_ctx.button_actions {
+            if let ButtonAction::Binary(a) = action {
+                if let Ok(state) = a.state(&xr_session, xr::Path::NULL) {
+                    let was = *prev_button_states.get(id).unwrap_or(&false);
+                    if state.current_state && !was {
+                        let path = alvr_common::BUTTON_INFO
+                            .get(id)
+                            .map(|i| i.path)
+                            .unwrap_or("unknown");
+                        info!("[btn] pressed: {}", path);
+                    }
+                    prev_button_states.insert(*id, state.current_state);
                 }
             }
         }

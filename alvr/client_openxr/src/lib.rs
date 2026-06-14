@@ -386,6 +386,7 @@ pub fn entry_point() {
         let mut session_running = false;
         let mut stream_context = None::<StreamContext>;
         let mut passthrough_layer = None;
+        let mut guardian_passthrough_injected = false;
 
         let mut event_storage = xr::EventDataBuffer::new();
         let mut headset_is_worn = true;
@@ -492,6 +493,7 @@ pub fn entry_point() {
                             passthrough_layer = PassthroughLayer::new(&xr_session, platform).ok();
                         }
 
+                        guardian_passthrough_injected = false;
                         interaction_context
                             .write()
                             .select_sources(&lobby_interaction_sources);
@@ -588,15 +590,24 @@ pub fn entry_point() {
                 continue;
             }
 
-            // Guardian config mode requests passthrough for the duration of the UI.
-            // Sync passthrough_layer with the flag from the input thread.
+            // Guardian config mode: sync passthrough layer + inject full-transparent
+            // blend mode so the camera feed shows through the VR projection layer.
             // Must happen before render() to avoid overlapping borrows.
-            if let Some(stream) = &stream_context {
-                let want = stream.guardian_passthrough.value() || stream.uses_passthrough();
+            if let Some(stream) = &mut stream_context {
+                let guardian_active = stream.guardian_passthrough.value();
+                let want = guardian_active || stream.uses_passthrough();
                 if want && passthrough_layer.is_none() {
                     passthrough_layer = PassthroughLayer::new(&xr_session, platform).ok();
                 } else if !want && passthrough_layer.is_some() {
                     passthrough_layer = None;
+                }
+                // Inject threshold=1.0 (fully transparent projection) while guardian UI is up
+                if guardian_active && !guardian_passthrough_injected {
+                    stream.set_guardian_passthrough(true);
+                    guardian_passthrough_injected = true;
+                } else if !guardian_active && guardian_passthrough_injected {
+                    stream.set_guardian_passthrough(false);
+                    guardian_passthrough_injected = false;
                 }
             }
 
