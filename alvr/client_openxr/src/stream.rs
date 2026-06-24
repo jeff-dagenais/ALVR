@@ -248,6 +248,7 @@ impl StreamContext {
             &xr_session,
             xr::ReferenceSpaceType::VIEW,
         ));
+        #[cfg(feature = "guardian_debug")]
         error!("[perf] initial get_reference_space: {:.1} ms", t0.elapsed().as_secs_f64() * 1000.0);
 
         let shared_stage_space = Arc::new(RwLock::new(Arc::clone(&stage_reference_space)));
@@ -359,6 +360,7 @@ impl StreamContext {
         *self.shared_view_space.write() = new_view;
 
         self.refspace_update_count += 1;
+        #[cfg(feature = "guardian_debug")]
         error!(
             "[perf] refspace update #{} — get: {:.1} ms, no thread respawn",
             self.refspace_update_count, get_ms
@@ -749,7 +751,7 @@ fn stream_input_loop(
     let now_ms = || -> u64 {
         std::time::SystemTime::now().duration_since(epoch).unwrap_or_default().as_millis() as u64
     };
-    #[cfg(target_os = "android")]
+    #[cfg(all(target_os = "android", feature = "guardian_debug"))]
     let mut next_pos_log = Instant::now();
     // Velocity-based early warning state; None until first margin sample (avoids startup spike)
     #[cfg(target_os = "android")]
@@ -918,9 +920,11 @@ fn stream_input_loop(
             }
             vel_alert_active = vel_now_active;
 
+            #[cfg(feature = "guardian_debug")]
             let ttb_log = if ttb == f32::MAX { 99.0 } else { ttb };
 
-            // Throttled status log every 500 ms
+            // Throttled status log every 500 ms (guardian_debug feature only)
+            #[cfg(feature = "guardian_debug")]
             if t >= next_pos_log {
                 error!(
                     "[bnd] margin={:.2} v={:.2}m/s ttb={:.1}s dist={:.2} vel={:.2} config[{}]={:.0}x{:.0}m",
@@ -959,6 +963,7 @@ fn stream_input_loop(
                         (2000.0 - 1600.0 * alert_level) as u64
                     };
                     beep_gate_ms.store(t_ms + interval_ms, Ordering::Relaxed);
+                    #[cfg(feature = "guardian_debug")]
                     error!(
                         "[beep] level={:.2} interval={}ms margin={:.2} ttb={:.1}s v={:.2} beyond={}",
                         alert_level, interval_ms, margin, ttb_log, closing_rate, beyond
