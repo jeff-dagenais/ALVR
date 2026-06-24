@@ -18,7 +18,7 @@ use alvr_graphics::{GraphicsContext, StreamRenderer, StreamViewParams};
 use alvr_packets::{RealTimeConfig, StreamConfig, TrackingData};
 use alvr_session::{
     ClientsideFoveationConfig, ClientsideFoveationMode, ClientsidePostProcessingConfig, CodecType,
-    FoveatedEncodingConfig, MediacodecProperty, PassthroughMode, UpscalingConfig,
+    FoveatedEncodingConfig, MediacodecProperty, PassthroughMode, RgbChromaKeyConfig, UpscalingConfig,
 };
 use alvr_system_info::Platform;
 use openxr as xr;
@@ -28,7 +28,7 @@ use std::{
     rc::Rc,
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -94,19 +94,26 @@ pub struct StreamContext {
     core_context: Arc<ClientCoreContext>,
     xr_session: xr::Session<xr::OpenGlEs>,
     interaction_context: Arc<RwLock<InteractionContext>>,
+    // Used by render() — held on the struct so &xr::Space lifetime is tied to self.
     stage_reference_space: Arc<xr::Space>,
     view_reference_space: Arc<xr::Space>,
+    // Shared with the persistent input thread; updated in-place on ReferenceSpaceChangePending
+    // instead of killing and respawning the thread.
+    shared_stage_space: Arc<RwLock<Arc<xr::Space>>>,
+    shared_view_space: Arc<RwLock<Arc<xr::Space>>>,
     swapchains: [xr::Swapchain<xr::OpenGlEs>; 2],
     last_good_view_params: [ViewParams; 2],
     input_thread: Option<JoinHandle<()>>,
     input_thread_running: Arc<RelaxedAtomic>,
     pub guardian_passthrough: Arc<RelaxedAtomic>,
     pub guardian_mode_idx: Arc<AtomicUsize>,
+    beep_gate_ms: Arc<AtomicU64>,
     config: ParsedStreamConfig,
     target_view_resolution: UVec2,
     renderer: StreamRenderer,
     decoder: Option<(VideoDecoderConfig, VideoDecoderSource)>,
     use_custom_reprojection: bool,
+    refspace_update_count: u32,
 }
 
 impl StreamContext {
@@ -224,13 +231,15 @@ impl StreamContext {
             );
         }
 
-        let input_thread_running = Arc::new(RelaxedAtomic::new(false));
+        let input_thread_running = Arc::new(RelaxedAtomic::new(true));
         let guardian_passthrough = Arc::new(RelaxedAtomic::new(false));
         #[cfg(target_os = "android")]
         let guardian_mode_idx = Arc::new(AtomicUsize::new(DEFAULT_GUARDIAN_IDX));
         #[cfg(not(target_os = "android"))]
         let guardian_mode_idx = Arc::new(AtomicUsize::new(1));
+        let beep_gate_ms = Arc::new(AtomicU64::new(0));
 
+        let t0 = Instant::now();
         let stage_reference_space = Arc::new(interaction::get_reference_space(
             &xr_session,
             xr::ReferenceSpaceType::STAGE,
@@ -239,29 +248,72 @@ impl StreamContext {
             &xr_session,
             xr::ReferenceSpaceType::VIEW,
         ));
+        error!("[perf] initial get_reference_space: {:.1} ms", t0.elapsed().as_secs_f64() * 1000.0);
 
-        let mut this = StreamContext {
+        let shared_stage_space = Arc::new(RwLock::new(Arc::clone(&stage_reference_space)));
+        let shared_view_space = Arc::new(RwLock::new(Arc::clone(&view_reference_space)));
+
+        let input_thread = Some(thread::spawn({
+            let core_ctx2 = Arc::clone(&core_ctx);
+            let xr_session2 = xr_session.clone();
+            let interaction_ctx2 = Arc::clone(&interaction_ctx);
+            let shared_stage = Arc::clone(&shared_stage_space);
+            let shared_view = Arc::clone(&shared_view_space);
+            let refresh_rate = config.refresh_rate_hint;
+            let running = Arc::clone(&input_thread_running);
+            let gp = Arc::clone(&guardian_passthrough);
+            let gmi = Arc::clone(&guardian_mode_idx);
+            let bgm = Arc::clone(&beep_gate_ms);
+            move || {
+                stream_input_loop(
+                    &core_ctx2,
+                    xr_session2,
+                    &interaction_ctx2,
+                    shared_stage,
+                    shared_view,
+                    refresh_rate,
+                    running,
+                    gp,
+                    gmi,
+                    bgm,
+                )
+            }
+        }));
+
+        #[cfg(target_os = "android")]
+        {
+            let idx = guardian_mode_idx.load(Ordering::Relaxed);
+            let area = match GUARDIAN_CYCLE[idx] {
+                None => Vec2::new(0.001, 0.001),
+                Some(half) => Vec2::new(half, half),
+            };
+            core_ctx.send_playspace(Some(area));
+        }
+        #[cfg(not(target_os = "android"))]
+        core_ctx.send_playspace(Some(Vec2::new(20.0, 20.0)));
+
+        StreamContext {
             use_custom_reprojection: core_ctx.platform().is_yvr(),
             core_context: core_ctx,
             xr_session,
             interaction_context: interaction_ctx,
             stage_reference_space,
             view_reference_space,
+            shared_stage_space,
+            shared_view_space,
             swapchains,
             last_good_view_params: [ViewParams::DUMMY; 2],
-            input_thread: None,
+            input_thread,
             input_thread_running,
             guardian_passthrough,
             guardian_mode_idx,
+            beep_gate_ms,
             config,
             target_view_resolution,
             renderer,
             decoder: None,
-        };
-
-        this.update_reference_space();
-
-        this
+            refspace_update_count: 0,
+        }
     }
 
     pub fn uses_passthrough(&self) -> bool {
@@ -271,37 +323,53 @@ impl StreamContext {
     pub fn set_guardian_passthrough(&mut self, active: bool) {
         if active {
             if self.config.passthrough.is_none() {
-                self.config.passthrough =
-                    Some(PassthroughMode::Blend { premultiplied_alpha: false, threshold: 1.0 });
+                // Chroma-key black: the SteamVR void is black → transparent (camera shows through).
+                // Colored polar grid lines remain opaque.
+                self.config.passthrough = Some(PassthroughMode::RgbChromaKey(RgbChromaKeyConfig {
+                    red: 0,
+                    green: 0,
+                    blue: 0,
+                    distance_threshold: 40,
+                    feathering: 0.1,
+                }));
             }
-        } else {
-            if matches!(
-                self.config.passthrough,
-                Some(PassthroughMode::Blend { threshold, .. }) if (threshold - 1.0).abs() < f32::EPSILON
-            ) {
-                self.config.passthrough = None;
-            }
+        } else if matches!(self.config.passthrough, Some(PassthroughMode::RgbChromaKey(_))) {
+            self.config.passthrough = None;
         }
     }
 
     pub fn update_reference_space(&mut self) {
-        self.input_thread_running.set(false);
-
-        self.stage_reference_space = Arc::new(interaction::get_reference_space(
+        let t0 = Instant::now();
+        let new_stage = Arc::new(interaction::get_reference_space(
             &self.xr_session,
             xr::ReferenceSpaceType::STAGE,
         ));
-        self.view_reference_space = Arc::new(interaction::get_reference_space(
+        let new_view = Arc::new(interaction::get_reference_space(
             &self.xr_session,
             xr::ReferenceSpaceType::VIEW,
         ));
+        let get_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+        // Update render-path fields (used by render() via &self.stage_reference_space)
+        self.stage_reference_space = Arc::clone(&new_stage);
+        self.view_reference_space = Arc::clone(&new_view);
+
+        // Push new spaces to the persistent input thread — no kill/respawn
+        *self.shared_stage_space.write() = new_stage;
+        *self.shared_view_space.write() = new_view;
+
+        self.refspace_update_count += 1;
+        error!(
+            "[perf] refspace update #{} — get: {:.1} ms, no thread respawn",
+            self.refspace_update_count, get_ms
+        );
 
         #[cfg(target_os = "android")]
         {
             let idx = self.guardian_mode_idx.load(Ordering::Relaxed);
             let area = match GUARDIAN_CYCLE[idx] {
                 None => Vec2::new(0.001, 0.001),
-                Some(half) => Vec2::new(half * 2.0, half * 2.0),
+                Some(half) => Vec2::new(half, half),
             };
             match self
                 .xr_session
@@ -321,37 +389,6 @@ impl StreamContext {
         }
         #[cfg(not(target_os = "android"))]
         self.core_context.send_playspace(Some(Vec2::new(20.0, 20.0)));
-
-        if let Some(running) = self.input_thread.take() {
-            running.join().ok();
-        }
-
-        self.input_thread_running.set(true);
-
-        self.input_thread = Some(thread::spawn({
-            let core_ctx = Arc::clone(&self.core_context);
-            let xr_session = self.xr_session.clone();
-            let interaction_ctx = Arc::clone(&self.interaction_context);
-            let stage_reference_space = Arc::clone(&self.stage_reference_space);
-            let view_reference_space = Arc::clone(&self.view_reference_space);
-            let refresh_rate = self.config.refresh_rate_hint;
-            let running = Arc::clone(&self.input_thread_running);
-            let guardian_passthrough = Arc::clone(&self.guardian_passthrough);
-            let guardian_mode_idx = Arc::clone(&self.guardian_mode_idx);
-            move || {
-                stream_input_loop(
-                    &core_ctx,
-                    xr_session,
-                    &interaction_ctx,
-                    &stage_reference_space,
-                    &view_reference_space,
-                    refresh_rate,
-                    running,
-                    guardian_passthrough,
-                    guardian_mode_idx,
-                )
-            }
-        }));
     }
 
     pub fn maybe_initialize_decoder(&mut self, codec: CodecType, config_nal: Vec<u8>) {
@@ -620,27 +657,32 @@ impl<I: rodio::Source<Item = f32>> rodio::Source for BeepEnvelope<I> {
 // Some(half) = half-extent in metres; full area = half*2 on each axis.
 #[cfg(target_os = "android")]
 const GUARDIAN_CYCLE: &[Option<f32>] = &[
-    None,        // disabled
-    Some(10.0),  // 20×20 m
-    Some(7.5),   // 15×15 m  ← default (index 2)
-    Some(5.0),   // 10×10 m
-    Some(2.5),   //  5×5 m
-    Some(1.25),  //  2.5×2.5 m
+    None,         // disabled
+    Some(12.5),   // 25×25 m
+    Some(11.25),  // 22.5×22.5 m
+    Some(10.0),   // 20×20 m
+    Some(8.75),   // 17.5×17.5 m
+    Some(7.5),    // 15×15 m  ← default (index 5)
+    Some(6.25),   // 12.5×12.5 m
+    Some(5.0),    // 10×10 m
+    Some(3.75),   //  7.5×7.5 m
+    Some(2.5),    //  5×5 m
+    Some(1.25),   //  2.5×2.5 m
 ];
 #[cfg(target_os = "android")]
-const DEFAULT_GUARDIAN_IDX: usize = 2; // 15×15 m
+const DEFAULT_GUARDIAN_IDX: usize = 5; // 15×15 m
 
 #[cfg(target_os = "android")]
 fn apply_guardian_mode(mode: Option<f32>, core_ctx: &ClientCoreContext, idx: usize) {
     match mode {
         None => {
-            info!("[guardian] config[{}] = disabled", idx);
+            error!("[guardian] config[{}] = disabled", idx);
             core_ctx.send_playspace(Some(Vec2::new(0.001, 0.001)));
         }
         Some(half) => {
             let full = half * 2.0;
-            info!("[guardian] config[{}] = {:.0}x{:.0} m", idx, full, full);
-            core_ctx.send_playspace(Some(Vec2::new(full, full)));
+            error!("[guardian] config[{}] = {:.0}x{:.0} m", idx, full, full);
+            core_ctx.send_playspace(Some(Vec2::new(half, half)));
         }
     }
 }
@@ -649,14 +691,16 @@ fn stream_input_loop(
     core_ctx: &ClientCoreContext,
     xr_session: xr::Session<xr::OpenGlEs>,
     interaction_ctx: &RwLock<InteractionContext>,
-    stage_reference_space: &xr::Space,
-    view_reference_space: &xr::Space,
+    shared_stage_space: Arc<RwLock<Arc<xr::Space>>>,
+    shared_view_space: Arc<RwLock<Arc<xr::Space>>>,
     refresh_rate: f32,
     running: Arc<RelaxedAtomic>,
     #[cfg(target_os = "android")] guardian_passthrough: Arc<RelaxedAtomic>,
     #[cfg(not(target_os = "android"))] _guardian_passthrough: Arc<RelaxedAtomic>,
     #[cfg(target_os = "android")] guardian_mode_idx: Arc<AtomicUsize>,
     #[cfg(not(target_os = "android"))] _guardian_mode_idx: Arc<AtomicUsize>,
+    #[cfg(target_os = "android")] beep_gate_ms: Arc<AtomicU64>,
+    #[cfg(not(target_os = "android"))] _beep_gate_ms: Arc<AtomicU64>,
 ) {
     let mut last_controller_poses = [Pose::IDENTITY; 2];
     let mut last_palm_poses = [Pose::IDENTITY; 2];
@@ -669,8 +713,8 @@ fn stream_input_loop(
     #[cfg(target_os = "android")]
     let alert_stream = {
         match rodio::OutputStreamBuilder::open_default_stream() {
-            Ok(s) => { info!("[guardian] audio output stream opened"); Some(s) }
-            Err(e) => { warn!("[guardian] failed to open audio output stream: {e}"); None }
+            Ok(s) => { error!("[guardian] audio output stream opened"); Some(s) }
+            Err(e) => { error!("[guardian] failed to open audio output stream: {e}"); None }
         }
     };
     #[cfg(target_os = "android")]
@@ -679,7 +723,7 @@ fn stream_input_loop(
     {
         let half = GUARDIAN_CYCLE[current_mode_idx];
         let label = half.map_or("disabled".to_string(), |h| format!("{:.0}x{:.0} m", h*2.0, h*2.0));
-        info!("[guardian] initialized: config[{}]={} (X+Y hold 1.5 s → config mode, X tap → cycle)", current_mode_idx, label);
+        error!("[guardian] initialized: config[{}]={} (X+Y hold 1.5 s → config mode, X tap → cycle)", current_mode_idx, label);
     }
     // UI state: false = Normal, true = ConfigMode
     #[cfg(target_os = "android")]
@@ -697,8 +741,27 @@ fn stream_input_loop(
     // X tap while in config mode → cycle
     #[cfg(target_os = "android")]
     let mut x_armed = false;
+    // beep_gate_ms: epoch ms of next allowed beep, shared across threads so
+    // concurrent input-loop threads don't multiply the beep rate.
     #[cfg(target_os = "android")]
-    let mut next_beep_time = Instant::now();
+    let epoch = std::time::SystemTime::UNIX_EPOCH;
+    #[cfg(target_os = "android")]
+    let now_ms = || -> u64 {
+        std::time::SystemTime::now().duration_since(epoch).unwrap_or_default().as_millis() as u64
+    };
+    #[cfg(target_os = "android")]
+    let mut next_pos_log = Instant::now();
+    // Velocity-based early warning state; None until first margin sample (avoids startup spike)
+    #[cfg(target_os = "android")]
+    let mut prev_margin: Option<f32> = None;
+    #[cfg(target_os = "android")]
+    let mut prev_margin_t = Instant::now();
+    #[cfg(target_os = "android")]
+    let mut smoothed_closing_rate: f32 = 0.0;
+    #[cfg(target_os = "android")]
+    let mut vel_alert_active = false;
+    #[cfg(target_os = "android")]
+    let mut vel_burst_remaining: u8 = 0;
     // Button edge-detection for debug logging (identify unknown button IDs)
     #[cfg(target_os = "android")]
     let mut prev_button_states: HashMap<u64, bool> = HashMap::new();
@@ -706,6 +769,10 @@ fn stream_input_loop(
     let mut deadline = Instant::now();
     let frame_interval = Duration::from_secs_f32(1.0 / refresh_rate);
     while running.value() {
+        // Snapshot current reference spaces. Read lock held only for Arc clone (~5 ns).
+        let stage_reference_space = Arc::clone(&*shared_stage_space.read());
+        let view_reference_space = Arc::clone(&*shared_view_space.read());
+
         let int_ctx_lock = interaction_ctx.read();
         let int_ctx = &*int_ctx_lock;
         // Streaming related inputs are updated here. Make sure every input poll is done in this
@@ -726,8 +793,8 @@ fn stream_input_loop(
         let Some((head_motion, local_views)) = interaction::get_head_data(
             &xr_session,
             core_ctx.platform(),
-            stage_reference_space,
-            view_reference_space,
+            &stage_reference_space,
+            &view_reference_space,
             now,
             target_time,
             &last_view_params,
@@ -769,7 +836,7 @@ fn stream_input_loop(
                         x_armed = false;
                         config_mode_timeout = t + Duration::from_secs(4);
                         guardian_passthrough.set(true);
-                        info!("[guardian] entered config mode (X+Y held; passthrough on, 4 s timeout)");
+                        error!("[guardian] entered config mode (X+Y held; passthrough on, 4 s timeout)");
                     }
                 } else {
                     both_held_since = None;
@@ -779,7 +846,7 @@ fn stream_input_loop(
                 // Wait for X and Y to both be released after entry before arming X for cycle
                 if !entry_released && !x && !y {
                     entry_released = true;
-                    info!("[guardian] config mode: X+Y released, X tap to cycle options");
+                    error!("[guardian] config mode: X+Y released, X tap to cycle options");
                 }
 
                 if entry_released {
@@ -802,7 +869,7 @@ fn stream_input_loop(
                     entry_consumed = false;
                     both_held_since = None;
                     guardian_passthrough.set(false);
-                    info!("[guardian] exited config mode (timeout)");
+                    error!("[guardian] exited config mode (timeout)");
                 }
             }
         }
@@ -818,7 +885,7 @@ fn stream_input_loop(
                             .get(id)
                             .map(|i| i.path)
                             .unwrap_or("unknown");
-                        info!("[btn] pressed: {}", path);
+                        error!("[btn] pressed: {}", path);
                     }
                     prev_button_states.insert(*id, state.current_state);
                 }
@@ -831,23 +898,101 @@ fn stream_input_loop(
             let t = Instant::now();
             let hx = head_motion.pose.position.x;
             let hz = head_motion.pose.position.z;
-            let dx = (hx.abs() - half).max(0.0);
-            let dz = (hz.abs() - half).max(0.0);
-            let dist_outside = (dx * dx + dz * dz).sqrt();
-            // 0.0 at boundary, 1.0 at 1.5 m outside
-            let alert_level = (dist_outside / 1.5).min(1.0);
-            if alert_level > 0.0 && t >= next_beep_time {
-                if let Some(ref stream) = alert_stream {
-                    use rodio::Source as _;
-                    let raw = rodio::source::SineWave::new(880.0)
-                        .take_duration(Duration::from_millis(100));
-                    let beep = BeepEnvelope::new(raw, 10, 100).amplify(alert_level);
-                    stream.mixer().add(beep);
+            let margin = (half - hx.abs()).min(half - hz.abs());
+
+            // Unbiased EMA closing rate. Skip first frame (no prev) to avoid startup spike.
+            if let Some(pm) = prev_margin {
+                let dt = t.duration_since(prev_margin_t).as_secs_f32().max(0.001);
+                let inst_delta = (pm - margin) / dt; // positive = approaching
+                smoothed_closing_rate = 0.90 * smoothed_closing_rate + 0.10 * inst_delta;
+            }
+            let closing_rate = smoothed_closing_rate.max(0.0); // only use when approaching
+            prev_margin = Some(margin);
+            prev_margin_t = t;
+
+            const WARN_DIST: f32 = 1.5;
+            const LOOKAHEAD_S: f32 = 2.0; // velocity window: beep when ttb < 2 s
+
+            // Distance-based alert: 0 → 1 as margin closes from WARN_DIST → 0
+            let dist_alert = if margin >= 0.0 && margin < WARN_DIST {
+                (WARN_DIST - margin) / WARN_DIST
+            } else {
+                0.0_f32
+            };
+
+            // Velocity early warning: jump to 0.5 at entry, scale to 1.0 at ttb=0
+            let ttb = if closing_rate > 0.1 && margin > 0.0 {
+                margin / closing_rate
+            } else {
+                f32::MAX
+            };
+            let vel_alert = if ttb < LOOKAHEAD_S {
+                0.5 + 0.5 * (1.0 - ttb / LOOKAHEAD_S)
+            } else {
+                0.0_f32
+            };
+
+            // Detect velocity alert activation edge → trigger burst
+            let vel_now_active = vel_alert > 0.0;
+            if vel_now_active && !vel_alert_active {
+                vel_burst_remaining = 2; // 2 more rapid beeps after the trigger beep = 3 total
+                beep_gate_ms.store(0, Ordering::Relaxed);
+            }
+            vel_alert_active = vel_now_active;
+
+            let ttb_log = if ttb == f32::MAX { 99.0 } else { ttb };
+
+            // Throttled status log every 500 ms
+            if t >= next_pos_log {
+                error!(
+                    "[bnd] margin={:.2} v={:.2}m/s ttb={:.1}s dist={:.2} vel={:.2} config[{}]={:.0}x{:.0}m",
+                    margin, closing_rate, ttb_log, dist_alert, vel_alert,
+                    current_mode_idx, half * 2.0, half * 2.0
+                );
+                next_pos_log = t + Duration::from_millis(500);
+            }
+
+            // Receding: inside boundary and moving away — silence immediately, clear gate
+            let receding = margin >= 0.0 && smoothed_closing_rate < -0.05;
+            if receding {
+                beep_gate_ms.store(0, Ordering::Relaxed);
+                vel_alert_active = false;
+                vel_burst_remaining = 0;
+            }
+            let (alert_level, beyond) = if margin < 0.0 {
+                (1.0_f32, true)
+            } else if receding {
+                (0.0_f32, false)
+            } else {
+                let level = dist_alert.max(vel_alert);
+                if level > 0.0 { (level, false) } else { (0.0_f32, false) }
+            };
+
+            if alert_level > 0.0 {
+                let t_ms = now_ms();
+                let gate = beep_gate_ms.load(Ordering::Relaxed);
+                if t_ms >= gate {
+                    let interval_ms: u64 = if beyond {
+                        100
+                    } else if vel_burst_remaining > 0 {
+                        vel_burst_remaining -= 1;
+                        150 // rapid burst beep
+                    } else {
+                        (2000.0 - 1600.0 * alert_level) as u64
+                    };
+                    beep_gate_ms.store(t_ms + interval_ms, Ordering::Relaxed);
+                    error!(
+                        "[beep] level={:.2} interval={}ms margin={:.2} ttb={:.1}s v={:.2} beyond={}",
+                        alert_level, interval_ms, margin, ttb_log, closing_rate, beyond
+                    );
+                    if let Some(ref stream) = alert_stream {
+                        use rodio::Source as _;
+                        let raw = rodio::source::SineWave::new(880.0)
+                            .take_duration(Duration::from_millis(100));
+                        let beep = BeepEnvelope::new(raw, 10, 100).amplify(alert_level);
+                        stream.mixer().add(beep);
+                    }
                 }
-                // Interval: 3.0 s when barely outside → 0.3 s at 1.5 m+ outside
-                let interval_secs = 3.0 - 2.7 * alert_level;
-                let interval = Duration::from_secs_f32(interval_secs);
-                next_beep_time = (next_beep_time + interval).max(t + interval);
             }
         }
 
@@ -858,7 +1003,7 @@ fn stream_input_loop(
         let left_hand_data = crate::interaction::get_hand_data(
             &xr_session,
             core_ctx.platform(),
-            stage_reference_space,
+            &stage_reference_space,
             now,
             target_time,
             &int_ctx.hands_interaction[0],
@@ -868,7 +1013,7 @@ fn stream_input_loop(
         let right_hand_data = crate::interaction::get_hand_data(
             &xr_session,
             core_ctx.platform(),
-            stage_reference_space,
+            &stage_reference_space,
             now,
             target_time,
             &int_ctx.hands_interaction[1],
@@ -903,14 +1048,14 @@ fn stream_input_loop(
         let face = interaction::get_face_data(
             &xr_session,
             &int_ctx.face_sources,
-            view_reference_space,
+            &view_reference_space,
             now,
         );
 
         let body = int_ctx
             .body_source
             .as_ref()
-            .and_then(|source| interaction::get_body_skeleton(source, stage_reference_space, now));
+            .and_then(|source| interaction::get_body_skeleton(source, &stage_reference_space, now));
 
         if let Some(source) = &int_ctx.body_source {
             device_motions.append(&mut interaction::get_bd_motion_trackers(source, now));
@@ -922,7 +1067,7 @@ fn stream_input_loop(
             .write()
             .marker_spatial_context
             .as_mut()
-            .and_then(|ctx| interaction::get_marker_poses(ctx, stage_reference_space, now))
+            .and_then(|ctx| interaction::get_marker_poses(ctx, &stage_reference_space, now))
             .unwrap_or_default();
 
         // Even though the server is already adding the motion-to-photon latency, here we use
