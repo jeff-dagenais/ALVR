@@ -8,7 +8,7 @@ use alvr_client_core::{
 };
 use alvr_common::{
     DETACHED_CONTROLLER_LEFT_ID, DETACHED_CONTROLLER_RIGHT_ID, HAND_LEFT_ID, HAND_RIGHT_ID,
-    HEAD_ID, LEFT_X_CLICK_ID, LEFT_Y_CLICK_ID, Pose, RelaxedAtomic, ViewParams,
+    HEAD_ID, LEFT_THUMBSTICK_CLICK_ID, Pose, RelaxedAtomic, ViewParams,
     anyhow::Result,
     error, info, warn,
     glam::{UVec2, Vec2},
@@ -23,7 +23,7 @@ use alvr_session::{
 use alvr_system_info::Platform;
 use openxr as xr;
 use std::{
-    collections::HashMap,
+
     ptr,
     rc::Rc,
     sync::{
@@ -762,9 +762,6 @@ fn stream_input_loop(
     let mut vel_alert_active = false;
     #[cfg(target_os = "android")]
     let mut vel_burst_remaining: u8 = 0;
-    // Button edge-detection for debug logging (identify unknown button IDs)
-    #[cfg(target_os = "android")]
-    let mut prev_button_states: HashMap<u64, bool> = HashMap::new();
 
     let mut deadline = Instant::now();
     let frame_interval = Duration::from_secs_f32(1.0 / refresh_rate);
@@ -808,9 +805,9 @@ fn stream_input_loop(
         }
 
         // ── Guardian state machine ──────────────────────────────────────────────
-        // Entry: X+Y held simultaneously 1.5 s → config mode (passthrough on).
-        // Cycle: X tap while in config mode → next area option.
-        // Exit: 4 s with no X tap → passthrough off, setting persists.
+        // Entry: left thumbstick held 1.5 s → config mode (passthrough on).
+        // Cycle: thumbstick short tap while in config mode → next area option.
+        // Exit: 4 s with no tap → passthrough off, setting persists.
         #[cfg(target_os = "android")]
         {
             let get_bin = |id: &u64| -> bool {
@@ -822,12 +819,11 @@ fn stream_input_loop(
                     } else { None })
                     .map_or(false, |s| s.current_state)
             };
-            let x = get_bin(&LEFT_X_CLICK_ID);
-            let y = get_bin(&LEFT_Y_CLICK_ID);
+            let thumb = get_bin(&LEFT_THUMBSTICK_CLICK_ID);
             let t = Instant::now();
 
             if !ui_in_config_mode {
-                if x && y {
+                if thumb {
                     let held = both_held_since.get_or_insert(t);
                     if !entry_consumed && held.elapsed() >= Duration::from_millis(1500) {
                         ui_in_config_mode = true;
@@ -836,25 +832,25 @@ fn stream_input_loop(
                         x_armed = false;
                         config_mode_timeout = t + Duration::from_secs(4);
                         guardian_passthrough.set(true);
-                        error!("[guardian] entered config mode (X+Y held; passthrough on, 4 s timeout)");
+                        error!("[guardian] entered config mode (thumbstick held; passthrough on, 4 s timeout)");
                     }
                 } else {
                     both_held_since = None;
                     entry_consumed = false;
                 }
             } else {
-                // Wait for X and Y to both be released after entry before arming X for cycle
-                if !entry_released && !x && !y {
+                // Wait for thumbstick to be released after entry before arming for cycle
+                if !entry_released && !thumb {
                     entry_released = true;
-                    error!("[guardian] config mode: X+Y released, X tap to cycle options");
+                    error!("[guardian] config mode: thumbstick released, short tap to cycle options");
                 }
 
                 if entry_released {
-                    if x && !x_armed {
+                    if thumb && !x_armed {
                         x_armed = true;
                         config_mode_timeout = t + Duration::from_secs(4);
-                    } else if !x && x_armed {
-                        // X released → cycle
+                    } else if !thumb && x_armed {
+                        // thumbstick released → cycle
                         current_mode_idx = (current_mode_idx + 1) % GUARDIAN_CYCLE.len();
                         guardian_mode_idx.store(current_mode_idx, Ordering::Relaxed);
                         apply_guardian_mode(GUARDIAN_CYCLE[current_mode_idx], core_ctx, current_mode_idx);
@@ -870,24 +866,6 @@ fn stream_input_loop(
                     both_held_since = None;
                     guardian_passthrough.set(false);
                     error!("[guardian] exited config mode (timeout)");
-                }
-            }
-        }
-
-        // ── Button debug logging (log every binary button on press edge) ────────
-        #[cfg(target_os = "android")]
-        for (id, action) in &int_ctx.button_actions {
-            if let ButtonAction::Binary(a) = action {
-                if let Ok(state) = a.state(&xr_session, xr::Path::NULL) {
-                    let was = *prev_button_states.get(id).unwrap_or(&false);
-                    if state.current_state && !was {
-                        let path = alvr_common::BUTTON_INFO
-                            .get(id)
-                            .map(|i| i.path)
-                            .unwrap_or("unknown");
-                        error!("[btn] pressed: {}", path);
-                    }
-                    prev_button_states.insert(*id, state.current_state);
                 }
             }
         }
