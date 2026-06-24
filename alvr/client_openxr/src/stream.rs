@@ -725,7 +725,7 @@ fn stream_input_loop(
     {
         let half = GUARDIAN_CYCLE[current_mode_idx];
         let label = half.map_or("disabled".to_string(), |h| format!("{:.0}x{:.0} m", h*2.0, h*2.0));
-        error!("[guardian] initialized: config[{}]={} (X+Y hold 1.5 s → config mode, X tap → cycle)", current_mode_idx, label);
+        error!("[guardian] initialized: config[{}]={} (thumbstick hold 1.5 s → config mode, tap → cycle)", current_mode_idx, label);
     }
     // UI state: false = Normal, true = ConfigMode
     #[cfg(target_os = "android")]
